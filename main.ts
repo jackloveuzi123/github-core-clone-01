@@ -5,6 +5,9 @@
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
 //   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
+//      The hot paths behind this lifecycle are tuned: packs cache their deflated objects, fetches
+//      memoize shallow walks and tree closures, and the fast-forward proof walks commits alone.
+//      Nothing here changed: the lifecycle is the harness's, the tuning lives in src/ and app.ts.
 //   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
 //      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
 //      entry already registered, and this process keeps waiting like any other.
