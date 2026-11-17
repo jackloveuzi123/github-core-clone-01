@@ -276,6 +276,22 @@ export function collectReachable(repo: Repo, roots: Iterable<string>): Set<strin
   return seen;
 }
 
+/** Commit-only ancestry check with early exit: is `ancestorOid` reachable from `commitOid` through parents? */
+export function commitReachable(repo: Repo, ancestorOid: string, commitOid: string): boolean {
+  const seen = new Set<string>();
+  const stack = [commitOid];
+  while (stack.length) {
+    const oid = stack.pop()!;
+    if (oid === ancestorOid) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = repo.objects.get(oid);
+    if (object?.type !== 'commit') continue;
+    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+  }
+  return false;
+}
+
 /** Resolve a ref-ish name (HEAD, a branch, a tag, an oid) to an oid, or null. */
 export function resolveRef(repo: Repo, name: string): string | null {
   if (/^[0-9a-f]{40}$/.test(name)) return repo.objects.has(name) ? name : null;

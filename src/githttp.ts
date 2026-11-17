@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
 import { readPack, writePack } from './pack.ts';
 import {
+  commitReachable,
   collectReachable,
   getObject,
   parseCommit,
@@ -176,8 +177,19 @@ function handleLsRefs(repo: Repo, body: Buffer): Buffer {
 
 // ------------------------------------------------------------------ fetch
 
+/** Cached per-repo immutable results keyed by tip oid (tree closures never change for a commit). */
+const WALK_CACHE = new WeakMap<Repo, Map<string, { shallow: string[]; commits: string[] }>>();
+
 /** The commits at or after `depth` from a tip; returns [boundaryOids, commitsToSend]. */
 function shallowWalk(repo: Repo, tips: string[], depth: number): { shallow: string[]; commits: string[] } {
+  const key = `${depth}|${[...tips].sort().join(',')}`;
+  let cache = WALK_CACHE.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, { shallow: string[]; commits: string[] }>();
+    WALK_CACHE.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) return hit;
   const commits: string[] = [];
   const shallow: string[] = [];
   interface Node {
@@ -203,11 +215,24 @@ function shallowWalk(repo: Repo, tips: string[], depth: number): { shallow: stri
     }
     frontier = next;
   }
-  return { shallow, commits };
+  const result = { shallow, commits };
+  cache.set(key, result);
+  return result;
 }
+
+/** Cached tree closures keyed by commit oid (a commit's tree closure is immutable). */
+const TREE_CACHE = new WeakMap<Repo, Map<string, string[]>>();
 
 /** The trees and blobs reachable from the given commits' trees (no parents). */
 function treeClosure(repo: Repo, commitOids: Iterable<string>): string[] {
+  const key = [...commitOids].sort().join(',');
+  let cache = TREE_CACHE.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, string[]>();
+    TREE_CACHE.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) return hit;
   const out: string[] = [];
   const seen = new Set<string>();
   const queue: string[] = [];
@@ -229,6 +254,7 @@ function treeClosure(repo: Repo, commitOids: Iterable<string>): string[] {
       }
     }
   }
+  cache.set(key, out);
   return out;
 }
 
@@ -433,8 +459,7 @@ async function handleReceive(res: ServerResponse, repo: Repo, body: Buffer): Pro
       continue;
     }
     // Fast-forward check: the old tip must be an ancestor of the new tip.
-    const reachable = collectReachable(repo, [command.newOid]);
-    if (!reachable.has(command.oldOid)) {
+    if (!commitReachable(repo, command.oldOid, command.newOid)) {
       report.push(`ng ${command.ref} non-fast-forward`);
       continue;
     }

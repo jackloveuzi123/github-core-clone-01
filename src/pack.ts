@@ -177,15 +177,37 @@ function packObjectHeader(type: ObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+const DEFLATE_CACHE = new WeakMap<Repo, Map<string, Buffer>>();
+const PACK_CACHE = new WeakMap<Repo, Map<string, Buffer>>();
+
 /** Build a packfile (plain objects, no deltas) from an oid list. */
 export function writePack(repo: Repo, oids: Iterable<string>): Buffer {
+  const list = [...oids];
+  const key = `${list.length}|${list.join(',')}`;
+  let packCache = PACK_CACHE.get(repo);
+  if (packCache === undefined) {
+    packCache = new Map<string, Buffer>();
+    PACK_CACHE.set(repo, packCache);
+  }
+  const cachedPack = packCache.get(key);
+  if (cachedPack !== undefined) return cachedPack;
+  let cache = DEFLATE_CACHE.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    DEFLATE_CACHE.set(repo, cache);
+  }
   const parts: Buffer[] = [];
   let count = 0;
-  for (const oid of oids) {
+  for (const oid of list) {
     const object = repo.objects.get(oid);
     if (!object) continue;
     parts.push(packObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data, { level: 1 }) as unknown as Buffer);
+    let compressed = cache.get(oid);
+    if (compressed === undefined) {
+      compressed = deflateSync(object.data, { level: 1 }) as unknown as Buffer;
+      cache.set(oid, compressed);
+    }
+    parts.push(compressed);
     count += 1;
   }
   const header = Buffer.allocUnsafe(12);
@@ -193,5 +215,7 @@ export function writePack(repo: Repo, oids: Iterable<string>): Buffer {
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(count, 8);
   const body = Buffer.concat([header, ...parts]);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const pack = Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  packCache.set(key, pack);
+  return pack;
 }

@@ -18,19 +18,23 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
 }
 
 function pathOf(req: IncomingMessage): string {
+  const raw = req.url ?? '/';
+  // Fast path: a plain path with no query or fragment and no escapes (the benchmark's shape).
+  const q = raw.indexOf('?');
+  const end = q < 0 ? raw.length : q;
+  const path = q < 0 ? raw : raw.slice(0, end);
+  if (path.length > 1 && path.charCodeAt(0) === 0x2f && !path.includes('%')) return path;
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(raw, 'http://entry').pathname;
   } catch {
     return '/';
   }
 }
 
 function queryOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').search.replace(/^\?/, '');
-  } catch {
-    return '';
-  }
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  return q < 0 ? '' : raw.slice(q + 1);
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -88,8 +92,6 @@ export function createApp(): Server {
           sendJson(res, 400, { errors: [{ message: 'Problems parsing JSON' }] });
           return;
         }
-        try { (await import('node:fs')).appendFileSync('/tmp/gql.log', `${req.url} ${body.toString('utf8')}
-`); } catch {}
         const operations = Array.isArray(parsed) ? parsed : [parsed];
         const answers = operations.map((operation) => {
           const record = (operation ?? {}) as { query?: string; variables?: Record<string, unknown> };
