@@ -8,6 +8,7 @@ import { handleMcp } from './src/mcp.ts';
 import { Store, viewerLogin } from './src/store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
+const EMPTY_BODY = Buffer.alloc(0);
 
 let requestIdCounter = 1000;
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
@@ -48,9 +49,12 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function loginFromToken(req: IncomingMessage): string | null {
   const header = req.headers.authorization ?? '';
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  if (!match) return null;
+  if (header.length < 8) return null;
   // Any bearer token is the trial's token: the viewer it names is the scenario's first user.
+  const first = header.charCodeAt(0);
+  if (first !== 0x42 && first !== 0x62) return null; // B/b
+  const rest = header.slice(7).trim();
+  if (rest === '') return null;
   return viewerLogin();
 }
 
@@ -74,8 +78,15 @@ export function createApp(): Server {
         return;
       }
 
-      // Git smart HTTP: any path containing .git/ and the service verbs.
-      const body = await readBody(req);
+      // Git smart HTTP: any path containing .git/ and the service verbs. Requests that carry a body
+      // (git POSTs and the body-reading verbs) are read whole; GET/HEAD just drain (keep-alive
+      // needs the end event) and get the empty buffer.
+      let body = EMPTY_BODY;
+      if (method === 'GET' || method === 'HEAD') {
+        req.resume();
+      } else {
+        body = await readBody(req);
+      }
       if (await handleGitHttp(req, res, path, query, body, (owner, repo) => store.findRepo(owner, repo))) return;
 
       const login = loginFromToken(req);

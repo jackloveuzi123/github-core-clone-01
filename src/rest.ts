@@ -107,8 +107,10 @@ function pullObject(repo: Repo, pull: PullRequest): Record<string, unknown> {
 }
 
 function parseQuery(query: string): URLSearchParams {
-  return new URLSearchParams(query);
+  return query === '' ? EMPTY_PARAMS : new URLSearchParams(query);
 }
+
+const EMPTY_PARAMS = new URLSearchParams('');
 
 function intParam(params: URLSearchParams, name: string, fallback: number): number {
   const value = Number(params.get(name));
@@ -305,8 +307,8 @@ export function handleRest(ctx: Ctx, method: string, path: string, query: string
   }
 
   if (parts[0] === 'repos' && parts.length >= 3) {
-    const owner = decodeURIComponent(parts[1]!);
-    const name = decodeURIComponent(parts[2]!);
+    const owner = parts[1]!.includes('%') ? decodeURIComponent(parts[1]!) : parts[1]!;
+    const name = parts[2]!.includes('%') ? decodeURIComponent(parts[2]!) : parts[2]!;
     const repo = store.findRepo(owner, name);
     // A repository belongs to the login the token names: another owner's path is 404, never 403.
     const rest = parts.slice(3);
