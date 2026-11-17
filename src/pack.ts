@@ -191,6 +191,18 @@ export function writePack(repo: Repo, oids: Iterable<string>): Buffer {
   }
   const cachedPack = packCache.get(key);
   if (cachedPack !== undefined) return cachedPack;
+  // Only objects that exist pack; if any oid is absent, the pack is not worth caching because
+  // the same oid list could pack differently once the object arrives.
+  for (const oid of list) {
+    if (!repo.objects.has(oid)) return buildPack(repo, list);
+  }
+  const pack = buildPack(repo, list);
+  packCache.set(key, pack);
+  return pack;
+}
+
+/** The pack bytes themselves; only complete oid lists reach the pack cache. */
+function buildPack(repo: Repo, list: string[]): Buffer {
   let cache = DEFLATE_CACHE.get(repo);
   if (cache === undefined) {
     cache = new Map<string, Buffer>();
@@ -215,7 +227,5 @@ export function writePack(repo: Repo, oids: Iterable<string>): Buffer {
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(count, 8);
   const body = Buffer.concat([header, ...parts]);
-  const pack = Buffer.concat([body, createHash('sha1').update(body).digest()]);
-  packCache.set(key, pack);
-  return pack;
+  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }

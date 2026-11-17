@@ -1,5 +1,6 @@
 // The REST v3 surface: repositories, branches, commits, contents, labels, issues, pulls, merges.
 
+import { touchRepoObjects, touchRepoRefs } from './githttp.ts';
 import {
   buildTreeFromFiles,
   commitFileChange,
@@ -245,6 +246,8 @@ export function mergePull(repo: Repo, pull: PullRequest): { ok: boolean; sha?: s
   ]);
   const sha = putObject(repo, 'commit', commitData);
   repo.refs.set(`refs/heads/${pull.base}`, sha);
+  touchRepoObjects(repo);
+  touchRepoRefs(repo);
   return { ok: true, sha };
 }
 
@@ -345,6 +348,7 @@ function handleRepoRest(ctx: Ctx, repo: Repo, method: string, rest: string[], pa
       if (!ref.startsWith('refs/heads/') || !repo.objects.has(sha)) return json(422, { message: 'bad ref or sha' });
       if (repo.refs.has(ref)) return json(422, { message: 'Reference already exists' });
       repo.refs.set(ref, sha);
+      touchRepoRefs(repo);
       return json(201, { ref, object: { sha } });
     }
     if (method === 'GET' && rest.length === 3 && second === 'refs') {
@@ -392,6 +396,8 @@ function handleRepoRest(ctx: Ctx, repo: Repo, method: string, rest: string[], pa
       if (content === null) return json(422, { message: 'content is required' });
       const created = existing === null;
       const commitOid = commitFileChange(repo, branch, filePath, content, typeof body?.message === 'string' ? body.message : 'update', now(repo));
+      touchRepoObjects(repo);
+      touchRepoRefs(repo);
       const blobOid = hashObject('blob', content);
       return json(created ? 201 : 200, {
         content: { name: filePath.split('/').pop(), path: filePath, sha: blobOid, size: content.length, type: 'file', encoding: 'base64', content: content.toString('base64'), url: '' },
@@ -404,6 +410,8 @@ function handleRepoRest(ctx: Ctx, repo: Repo, method: string, rest: string[], pa
       if (!existing) return json(404, { message: 'Not Found' });
       if (typeof body?.sha === 'string' && body.sha !== existing) return json(409, { message: 'sha mismatch' });
       const commitOid = commitFileChange(repo, branch, filePath, null, typeof body?.message === 'string' ? body.message : 'delete', now(repo));
+      touchRepoObjects(repo);
+      touchRepoRefs(repo);
       return json(200, { commit: { sha: commitOid } });
     }
   }

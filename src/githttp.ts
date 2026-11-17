@@ -89,21 +89,40 @@ function isTruthyHeader(headers: IncomingMessage['headers'], name: string): bool
 // ------------------------------------------------------------------ advertisement
 
 function advertiseRefsV0(res: ServerResponse, service: 'git-upload-pack' | 'git-receive-pack', repo: Repo | null): void {
+  const body = advertisementBuffer(service, repo);
   res.writeHead(200, {
     'content-type': `application/x-${service}-advertisement`,
     'cache-control': 'no-cache',
+    'content-length': body.length,
   });
+  res.end(body);
+}
+
+/** Advertisement responses per (epoch, service): the bytes are fully determined by the repo state. */
+const AD_CACHE = new WeakMap<Repo, Map<string, Buffer>>();
+
+function advertisementBuffer(service: 'git-upload-pack' | 'git-receive-pack', repo: Repo | null): Buffer {
+  if (!repo) {
+    const caps =
+      service === 'git-upload-pack'
+        ? 'multi_ack_detailed multi_ack side-band-64k thin-pack ofs-delta shallow agent=forge/1.0'
+        : 'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=forge/1.0';
+    return Buffer.concat([Pkt.encode(`# service=${service}\n`), Pkt.flush(), Pkt.encode(`${ZERO_OID} capabilities^{}\u0000${caps}\n`), Pkt.flush()]);
+  }
+  const epoch = repoEpoch(repo);
+  const key = `${service}|${epoch.objects}|${epoch.refs}`;
+  let cache = AD_CACHE.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    AD_CACHE.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) return hit;
   const chunks: Buffer[] = [Pkt.encode(`# service=${service}\n`), Pkt.flush()];
   const caps =
     service === 'git-upload-pack'
       ? 'multi_ack_detailed multi_ack side-band-64k thin-pack ofs-delta shallow agent=forge/1.0'
       : 'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=forge/1.0';
-  if (!repo) {
-    chunks.push(Pkt.encode(`${ZERO_OID} capabilities^{}\u0000${caps}\n`));
-    chunks.push(Pkt.flush());
-    res.end(Buffer.concat(chunks));
-    return;
-  }
   const refs = refList(repo);
   let first = true;
   let wroteAny = false;
@@ -126,7 +145,10 @@ function advertiseRefsV0(res: ServerResponse, service: 'git-upload-pack' | 'git-
     chunks.push(Pkt.encode(`${ZERO_OID} capabilities^{}\u0000${caps}\n`));
   }
   chunks.push(Pkt.flush());
-  res.end(Buffer.concat(chunks));
+  const body = Buffer.concat(chunks);
+  if (cache.size > 64) cache.clear();
+  cache.set(key, body);
+  return body;
 }
 
 function advertiseV2(res: ServerResponse, service: string): void {
@@ -176,6 +198,31 @@ function handleLsRefs(repo: Repo, body: Buffer): Buffer {
 }
 
 // ------------------------------------------------------------------ fetch
+
+/**
+ * Per-repo epoch bumped whenever the repository's objects or refs change: an entry of any cache
+ * keyed by the epoch describes the repo exactly as it stood, so the epoch is the cache's validity.
+ */
+const REPO_EPOCH = new WeakMap<Repo, { objects: number; refs: number }>();
+
+function repoEpoch(repo: Repo): { objects: number; refs: number } {
+  let state = REPO_EPOCH.get(repo);
+  if (state === undefined) {
+    state = { objects: repo.objects.size, refs: repo.refs.size };
+    REPO_EPOCH.set(repo, state);
+  }
+  return state;
+}
+
+/** A change to the repo's object set: caches keyed on the object set go stale. */
+export function touchRepoObjects(repo: Repo): void {
+  repoEpoch(repo).objects += 1;
+}
+
+/** A change to the repo's refs: caches keyed on the refs go stale. */
+export function touchRepoRefs(repo: Repo): void {
+  repoEpoch(repo).refs += 1;
+}
 
 /** Cached per-repo immutable results keyed by tip oid (tree closures never change for a commit). */
 const WALK_CACHE = new WeakMap<Repo, Map<string, { shallow: string[]; commits: string[] }>>();
@@ -258,7 +305,33 @@ function treeClosure(repo: Repo, commitOids: Iterable<string>): string[] {
   return out;
 }
 
+/** Full upload-pack responses per (epoch, request): identical requests against an unchanged repo repeat byte for byte. */
+const FETCH_CACHE = new WeakMap<Repo, Map<string, Buffer>>();
+
+function cachedFetchResponse(repo: Repo, body: Buffer, build: () => Buffer): Buffer {
+  const epoch = repoEpoch(repo);
+  const key = `${epoch.objects}|${epoch.refs}|${createHash('sha1').update(body).digest('hex')}`;
+  let cache = FETCH_CACHE.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    FETCH_CACHE.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const built = build();
+  if (cache.size > 128) cache.clear();
+  cache.set(key, built);
+  return built;
+}
+
 function handleFetchV2(res: ServerResponse, repo: Repo, body: Buffer, url: string): void {
+  const out = cachedFetchResponse(repo, body, () => fetchV2Body(repo, body));
+  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache', 'content-length': out.length });
+  res.end(out);
+  void url;
+}
+
+function fetchV2Body(repo: Repo, body: Buffer): Buffer {
   // v2 request: section 1 (command/agent/object-format) ends at a delim packet; the args follow.
   let inArgs = false;
   const wants: string[] = [];
@@ -315,12 +388,16 @@ function handleFetchV2(res: ServerResponse, repo: Repo, body: Buffer, url: strin
     offset += take;
   }
   chunks.push(Pkt.flush());
-  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
-  res.end(Buffer.concat(chunks));
-  void url;
+  return Buffer.concat(chunks);
 }
 
 function handleFetchV0(res: ServerResponse, repo: Repo, body: Buffer): void {
+  const out = cachedFetchResponse(repo, body, () => fetchV0Body(repo, body));
+  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache', 'content-length': out.length });
+  res.end(out);
+}
+
+function fetchV0Body(repo: Repo, body: Buffer): Buffer {
   // v0: section 1 (wants, shallow, deepen) ends at the first flush; section 2 has haves and done.
   const packets = decodePackets(body);
   const wants: string[] = [];
@@ -368,8 +445,7 @@ function handleFetchV0(res: ServerResponse, repo: Repo, body: Buffer): void {
     offset += take;
   }
   chunks.push(Pkt.flush());
-  res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' });
-  res.end(Buffer.concat(chunks));
+  return Buffer.concat(chunks);
 }
 
 // ------------------------------------------------------------------ receive-pack
@@ -424,6 +500,7 @@ async function handleReceive(res: ServerResponse, repo: Repo, body: Buffer): Pro
     } catch {
       unpackOk = false;
     }
+    if (unpackOk) touchRepoObjects(repo);
   }
   report.push(`unpack ${unpackOk ? 'ok' : 'unpacker error'}`);
   for (const command of commands) {
@@ -435,6 +512,7 @@ async function handleReceive(res: ServerResponse, repo: Repo, body: Buffer): Pro
     if (command.newOid === ZERO_OID) {
       if (current === command.oldOid || (current === undefined && command.oldOid === ZERO_OID)) {
         repo.refs.delete(command.ref);
+        touchRepoRefs(repo);
         report.push(`ok ${command.ref}`);
       } else {
         report.push(`ng ${command.ref} fetch first`);
@@ -451,6 +529,7 @@ async function handleReceive(res: ServerResponse, repo: Repo, body: Buffer): Pro
         continue;
       }
       repo.refs.set(command.ref, command.newOid);
+      touchRepoRefs(repo);
       report.push(`ok ${command.ref}`);
       continue;
     }
@@ -464,6 +543,7 @@ async function handleReceive(res: ServerResponse, repo: Repo, body: Buffer): Pro
       continue;
     }
     repo.refs.set(command.ref, command.newOid);
+    touchRepoRefs(repo);
     report.push(`ok ${command.ref}`);
   }
   const reportText = `${report.join('\n')}\n`;
